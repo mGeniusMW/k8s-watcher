@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	k8sApi "k8s.io/api/core/v1"
@@ -125,8 +129,79 @@ func AlertIfNeeded(event string, k8sPod *k8sApi.Pod, alertChan chan Alert) {
 	}
 }
 
+// sendAlertWithRetry attempts to send an alert with exponential backoff
+func sendAlertWithRetry(ctx context.Context, client *http.Client, alert Alert, marshalled []byte, maxRetries int) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if context is cancelled before attempting
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Create HTTP POST request with JSON body
+		req, err := http.NewRequestWithContext(ctx, "POST", "http://localhost:8000/alerts", bytes.NewReader(marshalled))
+		if err != nil {
+			return fmt.Errorf("failed to build request: %w", err)
+		}
+
+		// Set Content-Type header
+		req.Header.Set("Content-Type", "application/json")
+
+		// Execute request
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries-1 {
+				backoff := time.Duration(1<<uint(attempt)) * time.Second
+				log.Printf("attempt %d/%d failed for %s/%s: %v - retrying in %v",
+					attempt+1, maxRetries, alert.Pod.Namespace, alert.Pod.Name, err, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			return fmt.Errorf("all retry attempts exhausted: %w", lastErr)
+		}
+		defer resp.Body.Close()
+
+		// Check response status
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			fmt.Printf("%s %s/%s - Age: %s - Status: %s - Alert sent successfully\n",
+				alert.Event, alert.Pod.Namespace, alert.Pod.Name, alert.Age, alert.Pod.Status)
+			return nil
+		}
+
+		// Handle retryable status codes
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			if attempt < maxRetries-1 {
+				backoff := time.Duration(1<<uint(attempt)) * time.Second
+				log.Printf("attempt %d/%d failed for %s/%s: HTTP %d - retrying in %v",
+					attempt+1, maxRetries, alert.Pod.Namespace, alert.Pod.Name, resp.StatusCode, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			return fmt.Errorf("alert failed after retries for %s/%s - HTTP status: %d",
+				alert.Pod.Namespace, alert.Pod.Name, resp.StatusCode)
+		}
+
+		// Non-retryable error (4xx except 429)
+		return fmt.Errorf("non-retryable error for %s/%s - HTTP status: %d",
+			alert.Pod.Namespace, alert.Pod.Name, resp.StatusCode)
+	}
+
+	return lastErr
+}
+
 // worker processes alerts from the channel (Consumer)
-func worker(alertChan chan Alert) {
+func worker(ctx context.Context, wg *sync.WaitGroup, alertChan chan Alert) {
+	defer wg.Done()
+
+	// Create HTTP client once and reuse it (safe for concurrent use)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
 	for alert := range alertChan {
 		// Marshal the pod to JSON
 		marshalled, err := json.Marshal(alert.Pod)
@@ -135,37 +210,15 @@ func worker(alertChan chan Alert) {
 			continue
 		}
 
-		// Create HTTP POST request with JSON body
-		req, err := http.NewRequest("POST", "http://localhost:8000/alerts", bytes.NewReader(marshalled))
-		if err != nil {
-			log.Printf("impossible to build request: %s", err)
-			continue
-		}
-
-		// Set Content-Type header
-		req.Header.Set("Content-Type", "application/json")
-
-		// Create HTTP client and execute request
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("error sending request: %s", err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		// Check response status
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			fmt.Printf("%s %s/%s - Age: %s - Status: %s - Alert sent successfully\n",
-				alert.Event, alert.Pod.Namespace, alert.Pod.Name, alert.Age, alert.Pod.Status)
-		} else {
-			log.Printf("alert failed for %s/%s - HTTP status: %d\n",
-				alert.Pod.Namespace, alert.Pod.Name, resp.StatusCode)
+		// Send alert with retry mechanism (3 attempts with exponential backoff)
+		if err := sendAlertWithRetry(ctx, client, alert, marshalled, 3); err != nil {
+			log.Printf("DEAD LETTER: Failed to send alert for %s/%s after retries: %v",
+				alert.Pod.Namespace, alert.Pod.Name, err)
+			// TODO: In production, write to dead letter queue/file for manual investigation
 		}
 	}
+
+	log.Println("Worker shutting down gracefully - all alerts processed")
 }
 
 func main() {
@@ -181,11 +234,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Create buffered channel for alerts
 	alertChan := make(chan Alert, 100)
 
+	// Setup WaitGroup for worker
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	// Start worker goroutine to process alerts
-	go worker(alertChan)
+	go worker(ctx, &wg, alertChan)
 
 	factory := informers.NewSharedInformerFactory(clientset, time.Second*30)
 
@@ -228,5 +289,22 @@ func main() {
 
 	fmt.Println("Watcher started... waiting for changes in 'kind' cluster.")
 
-	select {}
+	// Setup signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	<-sigChan
+	fmt.Println("\nShutdown signal received, draining alerts...")
+
+	// Close the alert channel to signal worker to finish processing remaining alerts
+	close(alertChan)
+
+	// Wait for worker to finish processing remaining alerts with context still active
+	wg.Wait()
+
+	// Cancel context only after all work is done
+	cancel()
+
+	fmt.Println("Graceful shutdown complete")
 }
