@@ -25,6 +25,12 @@ type LocalPod struct {
 	ContainerStatuses []string `json:"containerStatuses"`
 }
 
+type Alert struct {
+	Event string
+	Pod   LocalPod
+	Age   string
+}
+
 func PodAge(pod *k8sApi.Pod) time.Duration {
 	if pod == nil {
 		return 0
@@ -97,7 +103,8 @@ func BuildLocalPod(k8sPod *k8sApi.Pod) LocalPod {
 	}
 }
 
-func AlertIfNeeded(event string, k8sPod *k8sApi.Pod) {
+// AlertIfNeeded checks if an alert should be sent and if so, sends it to the channel (Producer)
+func AlertIfNeeded(event string, k8sPod *k8sApi.Pod, alertChan chan Alert) {
 	rawAge := PodAge(k8sPod)
 	if rawAge < 30*time.Second {
 		return
@@ -109,41 +116,55 @@ func AlertIfNeeded(event string, k8sPod *k8sApi.Pod) {
 	}
 
 	ageText := FormatAgeShort(rawAge)
-	marshalled, err := json.Marshal(myLocalPod)
-	if err != nil {
-		fmt.Printf("Error marshalling pod to JSON: %v\n", err)
-		return
+
+	// Send alert to channel (non-blocking producer)
+	alertChan <- Alert{
+		Event: event,
+		Pod:   myLocalPod,
+		Age:   ageText,
 	}
+}
 
-	// Create HTTP POST request with JSON body
-	req, err := http.NewRequest("POST", "https://example.com/letsSeeWhichUrl", bytes.NewReader(marshalled))
-	if err != nil {
-		log.Printf("impossible to build request: %s", err)
-		return
-	}
+// worker processes alerts from the channel (Consumer)
+func worker(alertChan chan Alert) {
+	for alert := range alertChan {
+		// Marshal the pod to JSON
+		marshalled, err := json.Marshal(alert.Pod)
+		if err != nil {
+			log.Printf("Error marshalling pod to JSON: %v", err)
+			continue
+		}
 
-	// Set Content-Type header
-	req.Header.Set("Content-Type", "application/json")
+		// Create HTTP POST request with JSON body
+		req, err := http.NewRequest("POST", "http://localhost:8000/alerts", bytes.NewReader(marshalled))
+		if err != nil {
+			log.Printf("impossible to build request: %s", err)
+			continue
+		}
 
-	// Create HTTP client and execute request
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+		// Set Content-Type header
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("error sending request: %s", err)
-		return
-	}
-	defer resp.Body.Close()
+		// Create HTTP client and execute request
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+		}
 
-	// Check response status
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		fmt.Printf("%s %s/%s - Age: %s - Status: %s - Alert sent successfully\n",
-			event, myLocalPod.Namespace, myLocalPod.Name, ageText, myLocalPod.Status)
-	} else {
-		log.Printf("alert failed for %s/%s - HTTP status: %d\n",
-			myLocalPod.Namespace, myLocalPod.Name, resp.StatusCode)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("error sending request: %s", err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Check response status
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			fmt.Printf("%s %s/%s - Age: %s - Status: %s - Alert sent successfully\n",
+				alert.Event, alert.Pod.Namespace, alert.Pod.Name, alert.Age, alert.Pod.Status)
+		} else {
+			log.Printf("alert failed for %s/%s - HTTP status: %d\n",
+				alert.Pod.Namespace, alert.Pod.Name, resp.StatusCode)
+		}
 	}
 }
 
@@ -160,6 +181,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create buffered channel for alerts
+	alertChan := make(chan Alert, 100)
+
+	// Start worker goroutine to process alerts
+	go worker(alertChan)
+
 	factory := informers.NewSharedInformerFactory(clientset, time.Second*30)
 
 	LocalPodInformer := factory.Core().V1().Pods().Informer()
@@ -169,7 +196,7 @@ func main() {
 			if !ok {
 				return
 			}
-			AlertIfNeeded("POD ADDED:", k8sPod)
+			AlertIfNeeded("POD ADDED:", k8sPod, alertChan)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			newPod, ok := ExtractPod(newObj)
@@ -182,7 +209,7 @@ func main() {
 				return
 			}
 
-			AlertIfNeeded("POD UPDATED:", newPod)
+			AlertIfNeeded("POD UPDATED:", newPod, alertChan)
 		},
 		DeleteFunc: func(obj interface{}) {
 			k8sPod, ok := ExtractPod(obj)
