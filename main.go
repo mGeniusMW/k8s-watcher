@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,10 +19,10 @@ import (
 )
 
 type LocalPod struct {
-	Name              string 'json:"name"'
-	Namespace         string 
-	Status            string
-	ContainerStatuses []string
+	Name              string   `json:"name"`
+	Namespace         string   `json:"namespace"`
+	Status            string   `json:"status"`
+	ContainerStatuses []string `json:"containerStatuses"`
 }
 
 func PodAge(pod *k8sApi.Pod) time.Duration {
@@ -105,8 +109,42 @@ func AlertIfNeeded(event string, k8sPod *k8sApi.Pod) {
 	}
 
 	ageText := FormatAgeShort(rawAge)
-	fmt.Printf("Fire Alert!! %s %s/%s - Age: %s - Status: %s - Container States: %v\n",
-		event, myLocalPod.Namespace, myLocalPod.Name, ageText, myLocalPod.Status, myLocalPod.ContainerStatuses)
+	marshalled, err := json.Marshal(myLocalPod)
+	if err != nil {
+		fmt.Printf("Error marshalling pod to JSON: %v\n", err)
+		return
+	}
+
+	// Create HTTP POST request with JSON body
+	req, err := http.NewRequest("POST", "https://example.com/letsSeeWhichUrl", bytes.NewReader(marshalled))
+	if err != nil {
+		log.Printf("impossible to build request: %s", err)
+		return
+	}
+
+	// Set Content-Type header
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create HTTP client and execute request
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("error sending request: %s", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Printf("%s %s/%s - Age: %s - Status: %s - Alert sent successfully\n",
+			event, myLocalPod.Namespace, myLocalPod.Name, ageText, myLocalPod.Status)
+	} else {
+		log.Printf("alert failed for %s/%s - HTTP status: %d\n",
+			myLocalPod.Namespace, myLocalPod.Name, resp.StatusCode)
+	}
 }
 
 func main() {
