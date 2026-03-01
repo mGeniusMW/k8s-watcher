@@ -17,6 +17,7 @@ import (
 	k8sApi "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -222,10 +223,16 @@ func worker(ctx context.Context, wg *sync.WaitGroup, alertChan chan Alert) {
 }
 
 func main() {
-	config, err := clientcmd.BuildConfigFromFlags("", filepath.Join(homedir.HomeDir(), ".kube", "config"))
+	// 1. Try In-Cluster Config first (for when running inside K8s)
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load kubeconfig: %v\n", err)
-		os.Exit(1)
+		// 2. Fallback to Kubeconfig (for local development)
+		fmt.Println("Not running in cluster, falling back to kubeconfig")
+		kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.Fatalf("Error building kubeconfig: %s", err.Error())
+		}
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)

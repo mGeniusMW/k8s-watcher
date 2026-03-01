@@ -1,28 +1,56 @@
-# Binaries for programs and plugins
+# Go binaries
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
+# Go test binary
 *.test
 
-# Output of the go coverage tool
+# Go coverage
 *.out
 coverage.out
 
-# Go workspace file
+# Go workspace
 go.work
 
-# Dependency directories (if vendored)
+# Go dependencies
 vendor/
+
+# Python virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python distribution
+*.egg-info/
+*.egg
+*.whl
+dist/
+build/
+
+# Python bytecode
+*.pyo
+*.pyd
+.Python
 
 # IDE/editor files
 .vscode/
 .idea/
 *.swp
 *.swo
+*.iml
 
 # macOS
 .DS_Store
+
+# Environment files
+.env
+.env.local
